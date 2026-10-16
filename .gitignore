@@ -1,0 +1,16 @@
+/build/
+/build-*/
+/out/
+/.cache/
+/dist/
+/release-stage/
+/saves/
+/toolchain/
+.DS_Store
+__pycache__/
+*.pyc
+# your own disc image
+disc/*.cue
+disc/*.bin
+disc/*.img
+disc/*.chd

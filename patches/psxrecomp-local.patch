@@ -1,0 +1,283 @@
+diff --git a/runtime/src/cdrom.c b/runtime/src/cdrom.c
+index a0ed6d2d..bac2ef9e 100644
+--- a/runtime/src/cdrom.c
++++ b/runtime/src/cdrom.c
+@@ -1436,6 +1436,13 @@ static int maybe_deliver_xa_audio(const uint8_t* raw_data, int lba,
+     return 1;
+ }
+ 
++/* JoJo Phase 1 hook (see ps1-port/hybrid/psxrecomp_patches/cdrom_sector_override.patch): a project may provide a strong
++ * definition that fills raw[2352] for sectors it serves itself (file layer). Return 1 if filled, 0 to use the disc image. */
++__attribute__((weak)) int psx_cd_sector_override(void* iso_handle, uint32_t lba, uint8_t* raw) {
++    (void)iso_handle; (void)lba; (void)raw;
++    return 0;
++}
++
+ static int read_sector_at(int min, int sec, int sect) {
+     int lba = msf_to_lba(min, sec, sect);
+     uint8_t user_data[SECTOR_SIZE];
+@@ -1446,7 +1453,8 @@ static int read_sector_at(int min, int sec, int sect) {
+     int history_size = SECTOR_SIZE;
+ 
+     if (iso_handle) {
+-        have_raw = iso_read_raw_sector(iso_handle, lba, raw_data, RAW_SECTOR_SIZE);
++        have_raw = psx_cd_sector_override(iso_handle, (uint32_t)lba, raw_data);
++        if (!have_raw) have_raw = iso_read_raw_sector(iso_handle, lba, raw_data, RAW_SECTOR_SIZE);
+         if (have_raw) {
+             memcpy(user_data, raw_data + RAW_USER_DATA_OFFSET, SECTOR_SIZE);
+         } else if (!iso_read_sector(iso_handle, lba, user_data, SECTOR_SIZE)) {
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 27b495ea..47966f86 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -2865,6 +2865,7 @@ static void handle_dirty_ram_stats(int id, const char *json);
+ static void handle_dirty_ram_unsupported(int id, const char *json);
+ static void send_err(int id, const char *msg);
+ static void send_ok(int id);
++static void handle_jojo(int id, const char *json);   /* JoJo Phase 1 hook, defined next to debug_server_record_frame */
+ void debug_server_send_fmt(const char *fmt, ...);
+ #define send_fmt debug_server_send_fmt
+ 
+@@ -16080,6 +16081,7 @@ static const CmdEntry s_commands[] = {
+     { "fmv_state",         handle_fmv_state },
+     { "mdec_trace_clear",  handle_mdec_trace_clear },
+     { "set_input",         handle_set_input },
++    { "jojo",              handle_jojo },
+     { "press",             handle_press },
+     { "pad_status",        handle_pad_status },
+     { "rewind_status",     handle_rewind_status },
+@@ -16924,8 +16926,27 @@ void debug_server_poll(void)
+     SDL_UnlockMutex(s_io_mutex);
+ }
+ 
++/* JoJo Phase 1 hooks (ps1-port/hybrid/psxrecomp_patches/debug_frame_hook.patch). Weak, so a runtime without the hybrid glue links unchanged.
++ *   jojo_frame_hook(frame): called once per vblank at the start of the frame record (state recorder).
++ *   jojo_debug_command(json, out, n): command "jojo" of the debug server; writes a JSON value into out and returns 1, or an error text and 0. */
++__attribute__((weak)) void jojo_frame_hook(uint64_t frame) { (void)frame; }
++__attribute__((weak)) int jojo_debug_command(const char *json, char *out, size_t out_size)
++{
++    (void)json; snprintf(out, out_size, "hybrid glue not linked"); return 0;
++}
++
++static void handle_jojo(int id, const char *json)
++{
++    static char out[8192];
++    if (jojo_debug_command(json, out, sizeof out))
++        send_fmt("{\"id\":%d,\"ok\":true,\"result\":%s}", id, out);
++    else
++        send_err(id, out);
++}
++
+ void debug_server_record_frame(void)
+ {
++    jojo_frame_hook(s_frame_count);
+     if (s_fmv_quiet) {
+         s_history_count = s_frame_count + 1;
+         s_frame_count++;
+diff --git a/runtime/src/dma.c b/runtime/src/dma.c
+index b60d8add..a7e454e0 100644
+--- a/runtime/src/dma.c
++++ b/runtime/src/dma.c
+@@ -17,6 +17,7 @@
+ #include "crash_trace.h"
+ #include "dirty_ram_interp.h"
+ #include "dma_gpu_ll.h"
++extern void jojo_dev_hit(int dev);   /* JoJo Phase 1 device counter (device_counters.patch); weak default in memory.c */
+ #include "gpu.h"
+ #include "mdec.h"
+ #include "mod_memory.h"
+@@ -1096,6 +1097,7 @@ static void try_execute(int ch) {
+             start_async_mdec_transfer(1);
+             break;
+         case 2:
++            jojo_dev_hit(0);   /* JoJo Phase 1 device counter */
+             if ((channels[2].chcr & 1u) != 0u &&
+                 ((channels[2].chcr >> 9) & 3u) == 2u) {
+                 start_async_gpu_linked_list();
+@@ -1113,9 +1115,11 @@ static void try_execute(int ch) {
+             }
+             break;
+         case 3:
++            jojo_dev_hit(2);
+             execute_ch3_cdrom();
+             break;
+         case 4:
++            jojo_dev_hit(1);
+             schedule_delayed_complete(4, execute_ch4_spu(),
+                                       DMA_SPU_CYCLES_PER_WORD);
+             break;
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 8101a9e8..df67b8af 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -5679,6 +5679,14 @@ static void ws_repeat_textured_rect_reveal(int x, int y, int w, int h,
+ }
+ 
+ /* Execute textured rectangle (GP0 0x64-0x67) */
++/* JoJo debug hook (see gp0_exec_textured_rect): true only for the frame named by JOJO_DBG_RECT_FRAME. */
++extern uint64_t s_frame_count;
++static int dbg_rect_frame_wanted(void) {
++    static int init, want = -1;
++    if (!init) { const char *e = getenv("JOJO_DBG_RECT_FRAME"); want = e ? atoi(e) : -1; init = 1; }
++    return want >= 0 && (int64_t)s_frame_count == (int64_t)want;
++}
++
+ static void gp0_exec_textured_rect(void) {
+     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
+     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+@@ -5762,8 +5770,15 @@ static void gp0_exec_textured_rect(void) {
+     if (dw != w || ws_h != h)
+         gr_draw_textured_rect_scaled(x0, y0, dw, ws_h, u0, v0, u0 + w, v0 + h,
+                                      clut_x, clut_y, current_texpage());
+-    else
++    else {
++        /* JoJo debug hook (hybrid/psxrecomp_patches/gpu_debug_hooks.patch): env JOJO_DBG_RECT_FRAME=<frame> prints the
++         * arguments of every textured rect of that frame to stderr. Default off. */
++        if (dbg_rect_frame_wanted())
++            fprintf(stderr, "DBG_RECT frame=%llu x=%d y=%d w=%d h=%d u=%d v=%d clut=%u,%u tpage=0x%04x raw=%d word2=0x%08x\n",
++                    (unsigned long long)s_frame_count, x0, y0, w, h, u0, v0, (unsigned)clut_x, (unsigned)clut_y,
++                    (unsigned)current_texpage(), raw_texture, (unsigned)gp0_cmd_buf[2]);
+         gr_draw_textured_rect(x0, y0, w, h, u0, v0, clut_x, clut_y, current_texpage());
++    }
+     ws_repeat_textured_rect_reveal(x0, y0, w, h, u0, v0, clut_x, clut_y);
+ }
+ 
+@@ -7558,9 +7573,16 @@ static void gpu_write_gp0_body(uint32_t val) {
+  * rasterization / batching / VRAM transfer work on the emu thread — as its
+  * own phase so it is separable from the guest code that issued the write.
+  * Covers both the MMIO store chokepoint and DMA channel-2 feeds. */
++/* JoJo Phase 1 hooks (hybrid/psxrecomp_patches/gpu_gp0_hook.patch): every GP0 and GP1 word, from MMIO stores and from DMA feeds,
++ * passes through here. Weak: a no-op without the hybrid glue. The store PC is g_debug_last_store_pc, the caller's $ra is
++ * debug_guest_ra(). */
++extern __attribute__((weak)) void jojo_gp0_word(uint32_t val);
++extern __attribute__((weak)) void jojo_gp1_word(uint32_t val);
++
+ void gpu_write_gp0(uint32_t val) {
+     extern int g_exec_phase;
+     int prev_phase = g_exec_phase;
++    if (jojo_gp0_word) jojo_gp0_word(val);
+     g_exec_phase = 4;
+     gpu_write_gp0_body(val);
+     g_exec_phase = prev_phase;
+@@ -7709,6 +7731,7 @@ static void gp1_get_info(uint32_t val) {
+ 
+ void gpu_write_gp1(uint32_t val) {
+     uint32_t cmd = (val >> 24) & 0x3F;
++    if (jojo_gp1_word) jojo_gp1_word(val);
+ 
+     switch (cmd) {
+         case 0x00: gp1_reset(); break;
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index cf33df28..19b1b97a 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -8309,6 +8309,24 @@ static bool local_mouse_live(int override_word) {
+     return pad_ext_live(&g) != 0;
+ }
+ 
++/* JoJo Phase 1 hook: called after the host pad state of this vblank has been written to the SIO model. Weak: a no-op without the hybrid glue. */
++extern "C" __attribute__((weak)) void jojo_pad_frame(void) {}
++static CPUState *s_jojo_active_cpu = nullptr;
++/* CD callbacks are delivered after the guest quantum has returned, with the
++ * active CPUState available. The HLE build supplies the strong implementation;
++ * reference builds keep this no-op. */
++extern "C" __attribute__((weak)) void jojo_cd_frame_tick(CPUState *cpu, uint64_t frame)
++{
++    (void)cpu;
++    (void)frame;
++}
++/* Same point, for the memory card adapter (hybrid/jojo_saves.c). */
++extern "C" __attribute__((weak)) void jojo_saves_frame_tick(CPUState *cpu, uint64_t frame)
++{
++    (void)cpu;
++    (void)frame;
++}
++
+ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+     NetplayVblankEpilogue ep{};
+     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
+@@ -8344,6 +8362,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+     int override = -1;
+     int override_p2 = -1;
+ #endif
++    /* The current guest quantum has completed, so native CD events may call
++     * back into guest loader code without interrupting a CPS execution slice. */
++    if (s_jojo_active_cpu) {
++        jojo_cd_frame_tick(s_jojo_active_cpu, s_frame_count);
++        jojo_saves_frame_tick(s_jojo_active_cpu, s_frame_count);
++    }
+ 
+     psx_local_mouse_begin(sdl_window, local_mouse_live(override));
+     {
+@@ -8540,6 +8564,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+                 sample_pad_into_sio(override);
+             apply_input_override_port2(override_p2);
+             env_pad_hold_apply();
++            jojo_pad_frame();   /* JoJo Phase 1 hook (hybrid/psxrecomp_patches/pad_frame_hook.patch) */
+         }
+         /* Offline vblank boundary: record/replay/compare (PSX_RB_SELFCHECK).
+          * Defer opening a window while multitap arming is still pending —
+@@ -8875,6 +8900,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+             sample_pad_into_sio(override);
+             apply_input_override_port2(override_p2);
+             env_pad_hold_apply();
++            jojo_pad_frame();   /* JoJo Phase 1 hook (hybrid/psxrecomp_patches/pad_frame_hook.patch) */
+             latency_ring_restamp_input();
+         }
+     }
+@@ -19649,6 +19675,7 @@ session_reboot:
+     /* Initialize CPU state. */
+     CPUState cpu;
+     std::memset(&cpu, 0, sizeof(cpu));
++    s_jojo_active_cpu = &cpu;
+     /* R3000A load-delay interlock init (Beetle: BACKED_LDWhich=0x20 = no pending
+      * load; ReadFudge=0 so the first load gets no fudge). Rest is correctly 0. */
+     cpu.ld_which_t = 0x20;
+diff --git a/runtime/src/memcard.c b/runtime/src/memcard.c
+index c7c10afc..096b82c2 100644
+--- a/runtime/src/memcard.c
++++ b/runtime/src/memcard.c
+@@ -221,7 +221,9 @@ int memcard_summary_path(const char* path, MemcardSummary* out) {
+     return 0;
+ }
+ 
++extern void jojo_dev_hit(int dev);   /* JoJo Phase 1 device counter (device_counters.patch) */
+ int memcard_read_sector(int card, int sector, uint8_t* buf) {
++    jojo_dev_hit(4);
+     if (card < 0 || card >= MAX_CARDS) return -1;
+     if (!cards[card].present) return -1;
+     if (sector < 0 || sector >= MEMCARD_SECTORS) return -1;
+@@ -231,6 +233,7 @@ int memcard_read_sector(int card, int sector, uint8_t* buf) {
+ }
+ 
+ int memcard_write_sector(int card, int sector, const uint8_t* buf) {
++    jojo_dev_hit(4);
+     if (card < 0 || card >= MAX_CARDS) return -1;
+     if (!cards[card].present) return -1;
+     if (sector < 0 || sector >= MEMCARD_SECTORS) return -1;
+diff --git a/runtime/src/memory.c b/runtime/src/memory.c
+index b1e8235b..12229f83 100644
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -1171,6 +1171,21 @@ static inline uint16_t read_ram_half(uint32_t phys) {
+  * each key to the one store its ROM-address key named before the re-key, now
+  * whichever backend runs it. */
+ #include "psx_bios_known_images.h"
++
++/* JoJo Phase 1 hook (hybrid/psxrecomp_patches/device_counters.patch): count guest accesses to the emulated devices. The macros expand to the same call
++ * plus one weak counter call; with no hybrid glue linked the counter is a no-op. Device numbers: 0 GPU, 1 SPU, 2 CD, 3 SIO (pad and memory card), 4 memory card sector access (memcard.c). DMA starts are counted in dma.c. */
++extern void jojo_dev_hit(int dev);
++__attribute__((weak)) void jojo_dev_hit(int dev) { (void)dev; }
++#define sio_read(a_)   (jojo_dev_hit(3), sio_read(a_))
++#define sio_write(a_, v_)  do { jojo_dev_hit(3); sio_write((a_), (v_)); } while (0)
++#define cdrom_read(a_) (jojo_dev_hit(2), cdrom_read(a_))
++#define cdrom_write(a_, v_) do { jojo_dev_hit(2); cdrom_write((a_), (v_)); } while (0)
++#define spu_read(a_)   (jojo_dev_hit(1), spu_read(a_))
++#define spu_write(a_, v_)  do { jojo_dev_hit(1); spu_write((a_), (v_)); } while (0)
++#define gpu_read_gpuread()  (jojo_dev_hit(0), gpu_read_gpuread())
++#define gpu_read_gpustat()  (jojo_dev_hit(0), gpu_read_gpustat())
++#define gpu_write_gp0(v_)   do { jojo_dev_hit(0); gpu_write_gp0(v_); } while (0)
++#define gpu_write_gp1(v_)   do { jojo_dev_hit(0); gpu_write_gp1(v_); } while (0)
+ static inline int scph1001_relocated_store(uint32_t pc, uint32_t rom) {
+     if (g_debug_last_store_pc != pc) return 0;
+     static uint32_t s_scph1001_crc = 0;

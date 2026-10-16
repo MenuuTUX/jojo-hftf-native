@@ -1,0 +1,54 @@
+# Autofilled by tools/new_project_layout/probe_disc.py from your legal dump.
+# Review before shipping. Runtime quirks / overlay seeds still need hand work.
+
+[game]
+name = "JoJoPS1"
+id = "SLUS-01060"
+players = 2
+exe = "disc/SLUS_010.60"
+disc = "disc/JoJo's Bizarre Adventure (USA).cue"
+load_address = "0x80010000"
+entry_pc = "0x8001000C"
+text_size = "0x00089800"
+stack_base = "0x801FFFF0"
+
+# Digests are for data Track 01 (first BINARY FILE / TRACK 01).
+[prepare_disc]
+out_dir = "disc"
+bin_name = "JoJo's Bizarre Adventure (USA).bin"
+cue_name = "JoJo's Bizarre Adventure (USA).cue"
+boot_exe = "SLUS_010.60"
+known_sizes = [666806112]
+known_md5 = [
+  "0797420d6cb16467055f2dc35c7b77cc",
+]
+known_sha1 = [
+  "958a43d6beec42b4771ace1a18932489c4e088a0",
+]
+known_crc32 = [
+  "c4ac6fbb",
+]
+
+[recompiler]
+seeds = "seeds/ghidra_funcs.txt"
+out_dir = "generated"
+strict = true
+
+[runtime]
+window_title = "JoJoPS1 Recompiled"
+memcard_dir = "saves"
+overlay_cache = true
+
+[video]
+renderer = "opengl"
+aspect_ratio = "4:3"
+
+[controller]
+default_mode = "digital"
+
+# Online mount gate: digests + track count + optional TOC fingerprint
+# (see docs/NETPLAY.md).
+[netplay]
+require_cue = true
+required_tracks = 1
+required_disc_fp = "994c7aeab2be247bfeeeb3f9d149541a84ddd3b55e5a9feb4a81f84d5a4e2d42"
